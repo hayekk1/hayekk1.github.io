@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AETHER</title>
+<style>
+  :root{--bg:#0A1024;--ink:#E8EEFF;--dim:#8496B8;--cyan:#22D3EE;--line:#1E2A47}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);
+    font:16px/1.7 "Segoe UI",system-ui,sans-serif;padding:48px 20px 80px}
+  main{max-width:680px;margin:0 auto}
+  h1{font-size:15px;letter-spacing:.32em;font-weight:600;margin-bottom:28px}
+  h1 span{color:var(--cyan)}
+  h2{font-size:12px;letter-spacing:.2em;color:var(--cyan);margin:34px 0 10px;font-weight:600}
+  p{color:#CBD8F0;margin-bottom:14px}
+  ul{margin:0 0 14px 20px;color:#CBD8F0}
+  li{margin-bottom:7px}
+  a{color:var(--cyan)}
+  footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);
+    color:var(--dim);font-size:13px}
+</style>
+</head>
+<body>
+<main>
+  <h1>AETHER <span>·</span> AUTOMATED DOCUMENTARY CHANNEL</h1>
+
+  <p>AETHER is a personal, single-user application that produces and publishes long-form
+  documentary videos to one YouTube channel — the channel belonging to the person running it.
+  It runs on that person's own computer. There is no website to sign up for, no account to
+  create, and no service offered to anyone else.</p>
+
+  <h2>WHAT IT DOES</h2>
+  <p>Once a day it reads public trend feeds, selects one subject with genuine substance behind
+  it, writes a documentary script, sources public-domain and Creative Commons imagery with
+  attribution, narrates it, renders a video, runs an editorial quality check, and — if that check
+  passes — uploads the result to its owner's YouTube channel.</p>
+
+  <h2>WHY IT NEEDS GOOGLE ACCESS</h2>
+  <ul>
+    <li><b>YouTube Data API</b> — to upload the video, thumbnail and caption track to the
+      owner's own channel.</li>
+    <li><b>YouTube Analytics API</b> — to read the owner's own channel statistics for a private
+      performance report.</li>
+    <li><b>Gmail API</b> — to send that report to the owner's own email address, and nowhere
+      else.</li>
+  </ul>
+  <p>All three act only on the account of the person who installed and authorised the
+  application.</p>
+
+  <h2>SOURCE MATERIAL</h2>
+  <p>Imagery comes from Wikimedia Commons and Openverse under public-domain or Creative Commons
+  terms, and attribution is written into every video description automatically. Narration is
+  AI-assisted and disclosed as such on every video.</p>
+
+  <footer>
+    <a href="privacy.html">Privacy policy</a> · Contact: georgiohayek83@gmail.com
+  </footer>
+</main>
+</body>
+</html>
