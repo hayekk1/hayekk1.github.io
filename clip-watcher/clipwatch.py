@@ -16,6 +16,7 @@ HERE = Path(__file__).resolve().parent
 CHAT_WS = "wss://irc-ws.chat.twitch.tv:443"  # Twitch IRC over WebSocket, works through firewalls
 BOTS = {"nightbot", "streamelements", "streamlabs", "moobot", "fossabot", "wizebot", "sery_bot",
         "soundalerts", "botrixoficial", "kofistreambot", "pokemoncommunitygame", "blerp", "own3d"}
+STREAMLINK = [sys.executable, "-m", "streamlink"]  # works even if pip's Scripts folder isn't on PATH
 LIVE_NOW = {}  # session being recorded, so Ctrl+C can still clip it
 
 
@@ -84,7 +85,7 @@ def captions(cut, a):
     from faster_whisper import WhisperModel
     if _model is None:
         log(f"loading whisper '{a.model}' (first run downloads it)")
-        _model = WhisperModel(a.model, device="auto", compute_type="int8")
+        _model = WhisperModel(a.model, device="cpu", compute_type="int8")
     pcm = run(["ffmpeg", "-loglevel", "error", *cut, "-vn", "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
               capture_output=True).stdout
     segs, _ = _model.transcribe(np.frombuffer(pcm, np.float32), language=a.lang, vad_filter=True,
@@ -201,7 +202,7 @@ def vod(a):
             return str(Path(a.video).resolve())
         log("getting VOD video link...")
         try:
-            return run(["streamlink", "--stream-url", f"https://www.twitch.tv/videos/{vid}", a.quality],
+            return run([*STREAMLINK, "--stream-url", f"https://www.twitch.tv/videos/{vid}", a.quality],
                        capture_output=True, text=True).stdout.strip()
         except subprocess.CalledProcessError as e:
             sys.exit(f"Can't open the VOD video (sub-only, deleted or expired?)\n{e.stdout}{e.stderr}")
@@ -244,7 +245,7 @@ async def live(a):
         ts = session / "stream.ts"
         log(f"waiting for twitch.tv/{a.channel} to go live (checks every 30s)...")
         proc = await asyncio.create_subprocess_exec(
-            "streamlink", "--retry-streams", "30", f"twitch.tv/{a.channel}", a.quality, "-o", str(ts))
+            *STREAMLINK, "--retry-streams", "30", f"twitch.tv/{a.channel}", a.quality, "-o", str(ts))
         while proc.returncode is None and not ts.exists():
             try:
                 await asyncio.wait_for(proc.wait(), 1)
@@ -328,8 +329,10 @@ def main():
 
     if not shutil.which("ffmpeg"):
         sys.exit("ffmpeg not found - see README.md")
-    if a.cmd in ("live", "record") and not shutil.which("streamlink"):
-        sys.exit("streamlink not found - run: pip install -r requirements.txt")
+    try:
+        import streamlink, websockets, faster_whisper  # noqa: F401
+    except ImportError as e:
+        sys.exit(f"{e.name} missing - run: py -m pip install -r requirements.txt")
     try:
         if a.cmd == "vod":
             vod(a)

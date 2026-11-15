@@ -7,7 +7,7 @@ Combines the "Chat Clip Finder" guide (VOD mode) with live recording and auto ca
 ## Install (once, Windows or Mac)
 1. **Python 3.10+**: python.org, or `winget install Python.Python.3.12`. On Mac use `brew install python`.
 2. **ffmpeg**: `winget install Gyan.FFmpeg`. On Mac use `brew install ffmpeg`.
-3. In this folder: `pip install -r requirements.txt`
+3. In this folder: `py -m pip install -r requirements.txt` (Mac: `python3 -m pip ...`)
 4. **For VOD mode**: download TwitchDownloaderCLI from github.com/lay295/TwitchDownloader/releases.
    Pick `Windows-x64.zip`, `MacOSArm64.zip` (M1-M4) or `MacOS-x64.zip` (Intel), then unzip it into this folder.
    On Mac, also run `chmod +x TwitchDownloaderCLI`.
@@ -16,14 +16,14 @@ Combines the "Chat Clip Finder" guide (VOD mode) with live recording and auto ca
 
 **VOD (recommended).** Paste a past broadcast link (Videos → Past Broadcasts):
 ```
-python clipwatch.py vod https://www.twitch.tv/videos/1234567890 --preview   # see the moments first
-python clipwatch.py vod https://www.twitch.tv/videos/1234567890             # cut them
+py clipwatch.py vod https://www.twitch.tv/videos/1234567890 --preview   # see the moments first
+py clipwatch.py vod https://www.twitch.tv/videos/1234567890             # cut them
 ```
 It downloads only the chat and the 30s around each moment, not the whole stream.
 
 **Live.** Waits for the channel to go live, records it, and clips when the stream ends:
 ```
-python clipwatch.py live CHANNEL
+py clipwatch.py live CHANNEL
 ```
 Use this when VODs get deleted, muted or are sub-only. The PC must stay on. Ctrl+C stops it and still clips what it recorded.
 
