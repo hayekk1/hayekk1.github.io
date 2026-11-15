@@ -1,23 +1,216 @@
 #!/usr/bin/env python3
-"""Clip Watcher: record a Twitch stream + its chat, cut clips where chat spikes, add captions.
+"""Clip Watcher: let Twitch chat pick your clips.
+Finds the moments chat explodes and cuts them into vertical, captioned, credited clips.
 
-  python clipwatch.py record CHANNEL          # waits for live, records, clips when stream ends
-  python clipwatch.py clips  SESSION_DIR      # re-run clipping on a finished recording
+  python clipwatch.py vod https://www.twitch.tv/videos/123   past broadcast (recommended)
+  python clipwatch.py vod LINK --preview                      only list the moments, cut nothing
+  python clipwatch.py live CHANNEL                            record live, clip when the stream ends
+  python clipwatch.py clips recordings/CHANNEL/<date>         re-clip a live recording
 """
 import argparse, asyncio, json, random, re, shutil, subprocess, sys, time
 from collections import Counter
 from pathlib import Path
+from statistics import median
 
-CHAT_WS = "wss://irc-ws.chat.twitch.tv:443"  # same chat as irc:6667, but works through firewalls
+HERE = Path(__file__).resolve().parent
+CHAT_WS = "wss://irc-ws.chat.twitch.tv:443"  # Twitch IRC over WebSocket, works through firewalls
+BOTS = {"nightbot", "streamelements", "streamlabs", "moobot", "fossabot", "wizebot", "sery_bot",
+        "soundalerts", "botrixoficial", "kofistreambot", "pokemoncommunitygame", "blerp", "own3d"}
+LIVE_NOW = {}  # session being recorded, so Ctrl+C can still clip it
 
 
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
 
 
-# ---------------- 1+2: record video + chat ----------------
+def hms(s):
+    s = max(0, int(s))
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def run(cmd, **kw):
+    return subprocess.run([str(c) for c in cmd], check=True, **kw)
+
+
+# ---------------- finding the moments ----------------
+def find_moments(chat, duration, a):
+    """chat = [(seconds, user, text)]. Score = people in bucket / (median of 5 min each side + 1)."""
+    nb = int(duration // a.bucket) + 1
+    counts, seen, words = [0] * nb, set(), {}
+    for off, user, text in chat:
+        b = int(off // a.bucket)
+        if not 0 <= b < nb or user.lower() in BOTS or text.startswith("!") or (b, user) in seen:
+            continue  # skip bots, !commands, and repeat messages from one person (spam can't fake a spike)
+        seen.add((b, user))
+        counts[b] += 1
+        words.setdefault(b, Counter()).update(set(text.split()))
+    k = round(300 / a.bucket)
+    score = [c / (median(counts[max(0, i - k):i + k + 1]) + 1) for i, c in enumerate(counts)]
+    peaks = []
+    for i in sorted(range(nb), key=lambda i: -score[i]):
+        if len(peaks) >= a.top or score[i] < a.min_score:
+            break
+        t = i * a.bucket
+        if counts[i] >= a.min_msgs and all(abs(p["t"] - t) >= a.gap for p in peaks):
+            top = words[i].most_common(1)[0][0] if words.get(i) else ""
+            peaks.append({"t": t, "people": counts[i], "x": round(score[i], 1), "chat": top})
+    return counts, peaks  # strongest first
+
+
+def show(counts, peaks, duration, n_msgs, a):
+    bars = " ▁▂▃▄▅▆▇█"
+    per = max(1, -(-len(counts) // 60))
+    cols = [max(counts[i:i + per]) for i in range(0, len(counts), per)]
+    top = max(cols) or 1
+    print(f"\n{n_msgs} chat messages, {hms(duration)} of stream\n")
+    print("".join(bars[round(c / top * 8)] for c in cols))
+    print("0:00:00".ljust(max(8, len(cols) - 7)) + hms(duration) + "\n")
+    for n, p in enumerate(peaks, 1):
+        print(f"#{n}  {hms(p['t'])}  {p['people']} people in {a.bucket}s  ({p['x']}x normal)  "
+              f"chat: {p['chat'][:20]}  -> clip {hms(p['t'] - a.before)} to {hms(p['t'] + a.after)}")
+    if not peaks:
+        print("No moments found. Try a longer stream with a livelier chat, or --min-score 1.5")
+    print()
+
+
+# ---------------- captions ----------------
+_model = None
+
+
+def captions(cut, a):
+    """Whisper speech-to-text, grouped into short punchy chunks of a few words."""
+    global _model
+    import numpy as np
+    from faster_whisper import WhisperModel
+    if _model is None:
+        log(f"loading whisper '{a.model}' (first run downloads it)")
+        _model = WhisperModel(a.model, device="auto", compute_type="int8")
+    pcm = run(["ffmpeg", "-loglevel", "error", *cut, "-vn", "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+              capture_output=True).stdout
+    segs, _ = _model.transcribe(np.frombuffer(pcm, np.float32), language=a.lang, vad_filter=True,
+                                word_timestamps=True)
+    chunks, cur = [], []
+    for w in (w for s in segs for w in (s.words or [])):
+        if cur and (len(cur) >= a.words or w.start - cur[-1].end > 0.6):
+            chunks.append(cur)
+            cur = []
+        cur.append(w)
+    chunks += [cur] if cur else []
+    return [(c[0].start, c[-1].end, "".join(w.word for w in c).strip()) for c in chunks]
+
+
+def write_ass(path, events, tall):
+    """Subtitle file with 3 styles: Cap (speech, bottom), Hook (first 3s, top), Credit (top, small)."""
+    W, H = (1080, 1920) if tall else (1920, 1080)
+    cap, hook, cred = (78, 84, 42) if tall else (60, 64, 34)
+    low, top = (430, 230) if tall else (70, 100)  # keep clear of TikTok/Shorts buttons
+    style = "Style: {},Arial,{},{},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{},0,{},40,40,{},1"
+    def ts(t):
+        cs = int(round(max(0, t) * 100))
+        return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+    lines = ["[Script Info]", "ScriptType: v4.00+", f"PlayResX: {W}", f"PlayResY: {H}", "WrapStyle: 0",
+             "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
+             "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, Underline, "
+             "StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
+             "MarginR, MarginV, Encoding",
+             style.format("Cap", cap, "&H00FFFFFF", 6, 2, low), style.format("Hook", hook, "&H0000FFFF", 7, 8, top),
+             style.format("Credit", cred, "&H00FFFFFF", 4, 8, top - cred - 20), "", "[Events]",
+             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
+    for s, e, st, text in events:
+        text = text.replace("\\", "/").replace("{", "(").replace("}", ")")
+        lines.append(f"Dialogue: 0,{ts(s)},{ts(e)},{st},,0,0,0,,{text}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ---------------- cutting ----------------
+LAYOUTS = {
+    "crop": "crop=ih*9/16:ih,scale=1080:1920",  # 9:16 centre crop, fills the screen
+    "fit": "split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+           "boxblur=20:2[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2",  # whole frame on blur
+    "wide": "",  # keep 16:9
+}
+
+
+def make_clips(chat, duration, source, out, channel, date, a):
+    counts, peaks = find_moments(chat, duration, a)
+    show(counts, peaks, duration, len(chat), a)
+    out.mkdir(parents=True, exist_ok=True)
+    for p in peaks:
+        p.update(start=max(0, p["t"] - a.before), end=p["t"] + a.after)
+    (out / "moments.json").write_text(json.dumps(peaks, indent=2))
+    if a.preview or not peaks:
+        log(f"saved {out / 'moments.json'}" + ("  (run again without --preview to cut)" if a.preview else ""))
+        return
+    src = source() if callable(source) else source
+    notes = []
+    for n, p in enumerate(peaks, 1):
+        name = f"{n:02d}_{hms(p['t']).replace(':', '-')}_{re.sub(r'[^A-Za-z0-9]', '', p['chat'])[:16] or 'clip'}"
+        final = out / f"{name}.mp4"
+        cut = ["-ss", p["start"], "-i", src, "-t", a.before + a.after]  # frame-accurate, reads only this part
+        log(f"#{n}/{len(peaks)} cutting {hms(p['start'])} ({a.before + a.after}s)")
+        events = [] if a.no_captions else [(s, e, "Cap", t) for s, e, t in captions(cut, a)]
+        if a.hook:
+            events.append((0, 3, "Hook", a.hook))
+        if not a.no_credit:
+            events.append((0, a.before + a.after, "Credit", f"twitch.tv/{channel}"))
+        vf = [LAYOUTS[a.layout]] if LAYOUTS[a.layout] else []
+        if events:
+            write_ass(out / f"{name}.ass", events, tall=a.layout != "wide")
+            vf.append(f"ass={name}.ass")
+        run(["ffmpeg", "-y", "-loglevel", "error", *cut, *(["-vf", ",".join(vf)] if vf else []),
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "160k",
+             "-movflags", "+faststart", final.name], cwd=out)
+        notes.append(f"#{n} {final.name}\n   {p['x']}x normal chat, {p['people']} people in {a.bucket}s, "
+                     f"chat said: {p['chat']}\n   stream time {hms(p['start'])} - {hms(p['end'])}\n"
+                     f"   CREDIT: Clip from twitch.tv/{channel} ({date} stream)\n")
+    (out / "clips.txt").write_text("Post #1 first (biggest moment).\n\n" + "\n".join(notes), encoding="utf-8")
+    log(f"done: {len(peaks)} clips in {out}")
+
+
+# ---------------- VOD mode ----------------
+def find_tdl(a):
+    for c in [a.tdl, "TwitchDownloaderCLI", HERE / "TwitchDownloaderCLI", HERE / "TwitchDownloaderCLI.exe",
+              Path.cwd() / "TwitchDownloaderCLI", Path.cwd() / "TwitchDownloaderCLI.exe"]:
+        if c and (shutil.which(str(c)) or Path(c).is_file()):
+            return shutil.which(str(c)) or str(c)
+    sys.exit("TwitchDownloaderCLI not found (needed to download VOD chat). See README.md step 3, or pass --tdl PATH")
+
+
+def vod(a):
+    m = re.search(r"(\d{6,})", a.vod)
+    if not m:
+        sys.exit("Give a VOD link like https://www.twitch.tv/videos/1234567890")
+    vid = m.group(1)
+    out = Path(a.out) / f"vod_{vid}"
+    out.mkdir(parents=True, exist_ok=True)
+    chat_file = Path(a.chat) if a.chat else out / "chat.json"
+    if not chat_file.exists():
+        log("downloading chat (a long, busy VOD can take a few minutes)...")
+        run([find_tdl(a), "chatdownload", "--id", vid, "-o", chat_file])
+    data = json.loads(chat_file.read_text(encoding="utf-8-sig"))
+    chat = [(c["content_offset_seconds"], (c.get("commenter") or {}).get("name") or "",
+             (c.get("message") or {}).get("body") or "") for c in data.get("comments", [])]
+    if not chat:
+        sys.exit("No chat messages found. Is this a TwitchDownloader chat .json?")
+    video = data.get("video") or {}
+    duration = max(video.get("length") or 0, max(c[0] for c in chat))
+    channel = (data.get("streamer") or {}).get("name") or "streamer"
+
+    def source():
+        if a.video:
+            return str(Path(a.video).resolve())
+        log("getting VOD video link...")
+        try:
+            return run(["streamlink", "--stream-url", f"https://www.twitch.tv/videos/{vid}", a.quality],
+                       capture_output=True, text=True).stdout.strip()
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"Can't open the VOD video (sub-only, deleted or expired?)\n{e.stdout}{e.stderr}")
+    make_clips(chat, duration, source, out / "clips", channel.lower(), (video.get("created_at") or "")[:10], a)
+
+
+# ---------------- live mode ----------------
 async def chat_logger(channel, path):
-    """Anonymous read-only chat. One line per message: epoch<TAB>user<TAB>text."""
+    """Anonymous, read-only. One line per message: epoch<TAB>user<TAB>text."""
     import websockets
     while True:
         try:
@@ -41,7 +234,7 @@ async def chat_logger(channel, path):
             await asyncio.sleep(5)
 
 
-async def record(a):
+async def live(a):
     base = Path(a.out) / a.channel.lower()
     base.mkdir(parents=True, exist_ok=True)
     chat_task = asyncio.create_task(chat_logger(a.channel.lower(), base / "chat.log"))
@@ -51,8 +244,7 @@ async def record(a):
         ts = session / "stream.ts"
         log(f"waiting for twitch.tv/{a.channel} to go live (checks every 30s)...")
         proc = await asyncio.create_subprocess_exec(
-            "streamlink", "--retry-streams", "30",
-            f"twitch.tv/{a.channel}", f"{a.quality},best", "-o", str(ts))
+            "streamlink", "--retry-streams", "30", f"twitch.tv/{a.channel}", a.quality, "-o", str(ts))
         while proc.returncode is None and not ts.exists():
             try:
                 await asyncio.wait_for(proc.wait(), 1)
@@ -60,12 +252,14 @@ async def record(a):
                 pass
         if ts.exists():
             (session / "meta.json").write_text(json.dumps({"channel": a.channel.lower(), "start": time.time()}))
-            log(f"LIVE - recording to {ts}")
+            LIVE_NOW["session"] = session
+            log(f"LIVE - recording to {ts}  (Ctrl+C stops and still makes the clips)")
         await proc.wait()
+        LIVE_NOW.clear()
         if ts.exists() and ts.stat().st_size > 1_000_000:
             log("stream ended, making clips...")
             try:
-                await asyncio.to_thread(make_clips, session, a)
+                await asyncio.to_thread(clip_session, session, a)
             except Exception as e:
                 log(f"clipping failed: {e!r}  (retry: python clipwatch.py clips {session})")
         else:
@@ -79,43 +273,7 @@ async def record(a):
             return
 
 
-# ---------------- 3: find chat spikes ----------------
-def find_spikes(offsets, duration, a):
-    nbins = int(duration // a.bin) + 1
-    counts = [0] * nbins
-    for off in offsets:
-        if 0 <= off < duration:
-            counts[int(off // a.bin)] += 1
-    hist = int(a.window // a.bin)
-    cands = []
-    for i, c in enumerate(counts):
-        prev = counts[max(0, i - hist):i]
-        if len(prev) < 6:  # need at least 1 minute of history
-            continue
-        avg = max(sum(prev) / len(prev), 0.5)
-        if c >= a.min_msgs and c >= a.ratio * avg:
-            cands.append({"t": i * a.bin, "msgs": c, "x": round(c / avg, 1)})
-    picked = []  # strongest first, no two clips closer than 60s
-    for c in sorted(cands, key=lambda c: -c["msgs"]):
-        if all(abs(c["t"] - p["t"]) > 60 for p in picked):
-            picked.append(c)
-        if len(picked) >= a.max_clips:
-            break
-    return sorted(picked, key=lambda c: c["t"])
-
-
-def hms(s):
-    s = int(s)
-    return f"{s // 3600}h{s % 3600 // 60:02d}m{s % 60:02d}s"
-
-
-# ---------------- 4+5: cut + captions ----------------
-def srt_time(t):
-    ms = int(round(t * 1000))
-    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
-
-
-def make_clips(session, a):
+def clip_session(session, a):
     session = Path(session).resolve()
     meta = json.loads((session / "meta.json").read_text())
     ts = session / "stream.ts"
@@ -124,83 +282,69 @@ def make_clips(session, a):
     for line in (session.parent / "chat.log").read_text(encoding="utf-8", errors="replace").splitlines():
         p = line.split("\t", 2)
         if len(p) == 3 and start <= float(p[0]) <= end:
-            chat.append((float(p[0]) - start, p[2]))
-    spikes = find_spikes([o for o, _ in chat], end - start, a)
-    log(f"{len(chat)} chat messages, {len(spikes)} spikes")
-    out = session / "clips"
-    out.mkdir(exist_ok=True)
-    model = None
-    if spikes and not a.no_captions:
-        from faster_whisper import WhisperModel
-        log(f"loading whisper model '{a.model}' (first run downloads it)")
-        model = WhisperModel(a.model, device="auto", compute_type="int8")
-    summary = []
-    for n, s in enumerate(spikes, 1):
-        words = Counter(w for o, txt in chat if s["t"] <= o < s["t"] + a.bin for w in set(txt.split()))
-        top = words.most_common(1)[0][0] if words else "chat"
-        name = f"{n:02d}_{hms(s['t'])}_{re.sub(r'[^A-Za-z0-9]', '', top)[:20] or 'spike'}"
-        cs = max(0, s["t"] - a.lead)
-        raw = out / f"{name}_raw.mp4"
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(cs), "-i", str(ts), "-t", str(a.length),
-                        "-c", "copy", "-avoid_negative_ts", "make_zero", str(raw)], check=True)
-        vf = []
-        if a.vertical:
-            vf.append("crop=ih*9/16:ih,scale=1080:1920")
-        if model:
-            import numpy as np  # decode audio with ffmpeg (avoids PyAV version issues)
-            pcm = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(raw), "-f", "f32le", "-ac", "1",
-                                  "-ar", "16000", "-"], capture_output=True, check=True).stdout
-            segs, _ = model.transcribe(np.frombuffer(pcm, np.float32), language=a.lang, vad_filter=True)
-            srt = [f"{i}\n{srt_time(g.start)} --> {srt_time(g.end)}\n{g.text.strip()}\n"
-                   for i, g in enumerate(segs, 1)]
-            if srt:
-                (out / f"{name}.srt").write_text("\n".join(srt), encoding="utf-8")
-                vf.append(f"subtitles={name}.srt:force_style='FontSize=20,Outline=2,MarginV=40'")
-        final = out / f"{name}.mp4"
-        if vf:
-            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", raw.name, "-vf", ",".join(vf),
-                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "copy", final.name],
-                           check=True, cwd=out)
-            raw.unlink()
-        else:
-            raw.replace(final)
-        when = time.strftime("%Y-%m-%d", time.localtime(start))
-        summary.append(f"{final.name}\n  chat: {s['msgs']} msgs in {a.bin}s ({s['x']}x normal), top word: {top}\n"
-                       f"  stream time: {hms(cs)}\n  CREDIT: Clip from twitch.tv/{meta['channel']} ({when} stream)\n")
-        log(f"clip {n}/{len(spikes)}: {final.name}")
-    (out / "clips.txt").write_text("\n".join(summary) or "No spikes found. Try --ratio 2 or --min-msgs 5.\n")
-    log(f"done -> {out}")
+            chat.append((float(p[0]) - start, p[1], p[2]))
+    make_clips(chat, end - start, ts, session / "clips", meta["channel"],
+               time.strftime("%Y-%m-%d", time.localtime(start)), a)
 
 
+# ---------------- command line ----------------
 def main():
+    sys.stdout.reconfigure(errors="replace")
+    common = argparse.ArgumentParser(add_help=False)
+    g = common.add_argument_group("clip settings")
+    g.add_argument("--top", type=int, default=5, help="how many clips (default 5)")
+    g.add_argument("--before", type=int, default=20, help="seconds before the chat spike (default 20)")
+    g.add_argument("--after", type=int, default=10, help="seconds after the chat spike (default 10)")
+    g.add_argument("--gap", type=int, default=90, help="min seconds between two clips (default 90)")
+    g.add_argument("--bucket", type=int, default=10, help="counting slice in seconds (default 10)")
+    g.add_argument("--min-msgs", type=int, default=5, help="ignore moments with fewer people (default 5)")
+    g.add_argument("--min-score", type=float, default=2, help="ignore moments under Nx normal (default 2)")
+    g.add_argument("--layout", choices=LAYOUTS, default="crop",
+                   help="crop = 9:16 fill (default), fit = whole frame on blurred 9:16, wide = keep 16:9")
+    g.add_argument("--model", default="small", help="whisper: tiny/base/small/medium/large-v3 (default small)")
+    g.add_argument("--lang", default=None, help="speech language e.g. en, ar, es (default auto)")
+    g.add_argument("--words", type=int, default=4, help="max words per caption (default 4)")
+    g.add_argument("--no-captions", action="store_true")
+    g.add_argument("--no-credit", action="store_true", help="no twitch.tv/name on screen")
+    g.add_argument("--hook", help='text on screen for the first 3s, e.g. "wait for it"')
+    g.add_argument("--preview", action="store_true", help="only list the moments, cut nothing")
+    g.add_argument("--quality", default="best", help="video quality (default best)")
+    g.add_argument("--out", default="recordings", help="output folder (default recordings)")
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("record", help="wait for a channel to go live, record video+chat, clip at the end")
-    r.add_argument("channel")
-    r.add_argument("--quality", default="best", help="best, 1080p60, 720p60, 480p30... (falls back to best)")
-    r.add_argument("--out", default="recordings")
-    r.add_argument("--once", action="store_true", help="exit after one stream instead of waiting for the next")
-    c = sub.add_parser("clips", help="(re)make clips from a recorded session folder")
+    v = sub.add_parser("vod", parents=[common], help="clip a past broadcast")
+    v.add_argument("vod", help="VOD link or id")
+    v.add_argument("--chat", help="TwitchDownloader chat .json you already have")
+    v.add_argument("--video", help="cut from a video file you already have")
+    v.add_argument("--tdl", help="path to TwitchDownloaderCLI")
+    l = sub.add_parser("live", aliases=["record"], parents=[common], help="record a live stream and clip it")
+    l.add_argument("channel")
+    l.add_argument("--once", action="store_true", help="stop after one stream")
+    c = sub.add_parser("clips", parents=[common], help="re-clip a live recording folder")
     c.add_argument("session")
-    for p in (r, c):
-        p.add_argument("--ratio", type=float, default=3.0, help="spike = this many x the last 5 min avg (default 3)")
-        p.add_argument("--min-msgs", type=int, default=10, help="ignore spikes under N msgs per 10s (default 10)")
-        p.add_argument("--max-clips", type=int, default=10)
-        p.add_argument("--lead", type=int, default=30, help="seconds before the chat spike to start (default 30)")
-        p.add_argument("--length", type=int, default=45, help="clip length in seconds (default 45)")
-        p.add_argument("--model", default="small", help="whisper model: tiny/base/small/medium/large-v3 (default small)")
-        p.add_argument("--lang", default=None, help="speech language, e.g. en, ar (default: auto-detect)")
-        p.add_argument("--no-captions", action="store_true")
-        p.add_argument("--vertical", action="store_true", help="center-crop to 9:16 for Shorts/TikTok/Reels")
-        p.set_defaults(bin=10, window=300)
     a = ap.parse_args()
-    for tool in ("ffmpeg", "streamlink"):
-        if not shutil.which(tool):
-            sys.exit(f"missing '{tool}' - see README.md")
+    a.quality = f"{a.quality},best"
+
+    if not shutil.which("ffmpeg"):
+        sys.exit("ffmpeg not found - see README.md")
+    if a.cmd in ("live", "record") and not shutil.which("streamlink"):
+        sys.exit("streamlink not found - run: pip install -r requirements.txt")
     try:
-        asyncio.run(record(a)) if a.cmd == "record" else make_clips(a.session, a)
+        if a.cmd == "vod":
+            vod(a)
+        elif a.cmd == "clips":
+            clip_session(a.session, a)
+        else:
+            asyncio.run(live(a))
     except KeyboardInterrupt:
-        log("stopped")
+        session = LIVE_NOW.get("session")
+        if session and (session / "stream.ts").exists():
+            log("stopped - making clips from what was recorded...")
+            time.sleep(2)
+            clip_session(session, a)
+        else:
+            log("stopped")
 
 
 if __name__ == "__main__":

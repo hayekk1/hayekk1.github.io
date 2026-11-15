@@ -1,41 +1,58 @@
 # Clip Watcher
 
-Records a Twitch stream + its chat, finds the moments chat explodes, cuts 45s clips around them, and burns in captions. Runs unattended.
+Let Twitch chat pick your clips. It finds the moments chat explodes and cuts them into **vertical, captioned, credited** clips.
 
-## Install (once)
-1. Python 3.10+ and ffmpeg
-   - Windows: `winget install Python.Python.3.12 Gyan.FFmpeg`
-   - Mac: `brew install python ffmpeg`
-   - Linux: `sudo apt install python3-pip ffmpeg`
-2. `pip install -r requirements.txt`
+Combines the "Chat Clip Finder" guide (VOD mode) with live recording and auto captions.
+
+## Install (once, Windows or Mac)
+1. **Python 3.10+**: python.org, or `winget install Python.Python.3.12`. On Mac use `brew install python`.
+2. **ffmpeg**: `winget install Gyan.FFmpeg`. On Mac use `brew install ffmpeg`.
+3. In this folder: `pip install -r requirements.txt`
+4. **For VOD mode**: download TwitchDownloaderCLI from github.com/lay295/TwitchDownloader/releases.
+   Pick `Windows-x64.zip`, `MacOSArm64.zip` (M1-M4) or `MacOS-x64.zip` (Intel), then unzip it into this folder.
+   On Mac, also run `chmod +x TwitchDownloaderCLI`.
 
 ## Use
-```
-python clipwatch.py record CHANNEL
-```
-Waits until CHANNEL goes live, records video + chat, and when the stream ends writes clips to
-`recordings/CHANNEL/<date>/clips/` plus `clips.txt` (why each was picked + credit line).
-Keeps waiting for the next stream; add `--once` to stop after one.
 
-Re-clip a finished recording with different settings:
+**VOD (recommended).** Paste a past broadcast link (Videos → Past Broadcasts):
 ```
-python clipwatch.py clips recordings/CHANNEL/<date> --ratio 2 --vertical
+python clipwatch.py vod https://www.twitch.tv/videos/1234567890 --preview   # see the moments first
+python clipwatch.py vod https://www.twitch.tv/videos/1234567890             # cut them
 ```
+It downloads only the chat and the 30s around each moment, not the whole stream.
 
-## Settings
-| flag | default | meaning |
+**Live.** Waits for the channel to go live, records it, and clips when the stream ends:
+```
+python clipwatch.py live CHANNEL
+```
+Use this when VODs get deleted, muted or are sub-only. The PC must stay on. Ctrl+C stops it and still clips what it recorded.
+
+Output goes to `recordings/.../clips/`:
+- `01_...mp4`: the clips, ranked. #1 is the biggest moment, so post it first.
+- `clips.txt`: why each clip was picked, plus a ready-to-use credit line.
+- `moments.json`: the raw list.
+
+## Settings (add to any command)
+| flag | default | what |
 |---|---|---|
-| `--ratio` | 3 | spike = chat this many times busier than the last 5 min |
-| `--min-msgs` | 10 | ignore spikes with fewer msgs per 10s (lower for small channels) |
-| `--max-clips` | 10 | best N spikes per stream |
-| `--lead` / `--length` | 30 / 45 | start 30s before chat reacts, 45s long |
-| `--model` | small | whisper size: tiny, base, small, medium, large-v3 (bigger = slower, better) |
-| `--lang` | auto | speech language, e.g. `en`, `ar`, `es` |
-| `--vertical` | off | center-crop to 9:16 for Shorts/TikTok/Reels |
-| `--quality` | best | `720p60`, `480p`... to save disk (best ~ 3 GB/hour) |
+| `--top` | 5 | how many clips |
+| `--before` / `--after` | 20 / 10 | seconds before/after the chat spike. Clips start late? Raise `--before` |
+| `--layout` | crop | `crop` = 9:16 fill · `fit` = whole frame on a blurred 9:16 background (keeps the facecam) · `wide` = 16:9 |
+| `--hook "wait for it"` | none | big yellow text for the first 3s |
+| `--lang` | auto | speech language: `en`, `ar`, `es`... |
+| `--model` | small | whisper size: `tiny` (fast) → `large-v3` (best, slow) |
+| `--words` | 4 | max words per caption |
+| `--no-captions` / `--no-credit` | | turn those off |
+| `--gap` | 90 | min seconds between two clips |
+| `--min-score` | 2 | ignore moments under 2x normal chat |
+| `--chat chat.json` | | use a TwitchDownloader chat file you already have |
+| `--video file.mp4` | | cut from a video you already have |
+| `--quality` | best | e.g. `720p60` (falls back to best) |
 
-## Limits
-- Must be running while the streamer is live. PC must stay on and awake.
-- Ctrl+C mid-stream skips auto clipping; run the `clips` command on that folder after.
-- Ad breaks can shift clip timing by a few seconds.
-- Credit + link isn't permission. Many streamers allow clip channels, some don't. Check before you monetize.
+## How moments are picked
+- Chat is counted in 10-second slices. Each person counts once per slice, so one spammer can't fake a spike.
+- Bots (Nightbot, StreamElements...) and `!commands` are ignored.
+- Score = slice ÷ (median of the 5 min around it + 1). Busy streams only flag what is loud *for them*.
+
+## Rules
+Only clip streamers who allow it: check their panels or Discord, or join their clipping campaign. Credit + link is not permission.
