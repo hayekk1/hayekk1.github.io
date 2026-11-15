@@ -1,3 +1,4 @@
 streamlink>=6
 websockets>=15
 faster-whisper>=1.0
+twitch-dl>=3

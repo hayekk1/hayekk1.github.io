@@ -17,6 +17,7 @@ CHAT_WS = "wss://irc-ws.chat.twitch.tv:443"  # Twitch IRC over WebSocket, works 
 BOTS = {"nightbot", "streamelements", "streamlabs", "moobot", "fossabot", "wizebot", "sery_bot",
         "soundalerts", "botrixoficial", "kofistreambot", "pokemoncommunitygame", "blerp", "own3d"}
 STREAMLINK = [sys.executable, "-m", "streamlink"]  # works even if pip's Scripts folder isn't on PATH
+POLL = re.compile(r"\+?\d{1,2}|yo|si+|sí|no+|yes|me|here|aqui|aquí|presente?|yo tambi[eé]n|me too|a ?m[ií]|✋|🙋")
 LIVE_NOW = {}  # session being recorded, so Ctrl+C can still clip it
 
 
@@ -37,7 +38,7 @@ def run(cmd, **kw):
 def find_moments(chat, duration, a):
     """chat = [(seconds, user, text)]. Score = people in bucket / (median of 5 min each side + 1)."""
     nb = int(duration // a.bucket) + 1
-    counts, seen, words = [0] * nb, set(), {}
+    counts, seen, words, answers = [0] * nb, set(), {}, {}
     for off, user, text in chat:
         b = int(off // a.bucket)
         if not 0 <= b < nb or user.lower() in BOTS or text.startswith("!") or (b, user) in seen:
@@ -45,6 +46,7 @@ def find_moments(chat, duration, a):
         seen.add((b, user))
         counts[b] += 1
         words.setdefault(b, Counter()).update(set(text.split()))
+        answers.setdefault(b, Counter())[text.strip().lower()] += 1
     k = round(300 / a.bucket)
     score = [c / (median(counts[max(0, i - k):i + k + 1]) + 1) for i, c in enumerate(counts)]
     peaks = []
@@ -52,6 +54,10 @@ def find_moments(chat, duration, a):
         if len(peaks) >= a.top or score[i] < a.min_score:
             break
         t = i * a.bucket
+        if not a.keep_polls and answers.get(i):  # chat answering the streamer ("+1", "yo", "si") isn't a moment
+            polls = sum(n for m, n in answers[i].items() if POLL.fullmatch(m))
+            if polls >= 0.25 * sum(answers[i].values()):
+                continue
         if counts[i] >= a.min_msgs and all(abs(p["t"] - t) >= a.gap for p in peaks):
             top = words[i].most_common(1)[0][0] if words.get(i) else ""
             peaks.append({"t": t, "people": counts[i], "x": round(score[i], 1), "chat": top})
@@ -177,6 +183,55 @@ def find_tdl(a):
     sys.exit("TwitchDownloaderCLI not found (needed to download VOD chat). See README.md step 3, or pass --tdl PATH")
 
 
+def download_chat(vid, path, workers=12):
+    """Download a VOD's chat with twitch-dl, many time chunks in parallel. Saves TwitchDownloader-style JSON."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from twitchdl import twitch
+    video = twitch.get_video(vid)
+    if not video:
+        sys.exit("VOD not found (deleted, expired or sub-only?)")
+    length = video["lengthSeconds"]
+    step = max(300, -(-length // (workers * 4)))
+
+    def page(**kw):
+        for attempt in range(5):
+            try:
+                return twitch.get_comments(vid, **kw)["comments"]
+            except Exception:
+                time.sleep(2 + attempt * 3)
+        raise RuntimeError(f"chat download failed at {kw}")
+
+    def chunk(start):
+        got, c = [], page(offset_seconds=start)
+        while True:
+            for e in c["edges"]:
+                n = e["node"]
+                if n["contentOffsetSeconds"] >= start + step:
+                    return got
+                if n["contentOffsetSeconds"] >= start:
+                    got.append(n)
+            if not c["edges"] or not c["pageInfo"]["hasNextPage"]:
+                return got
+            c = page(cursor=c["edges"][-1]["cursor"])
+
+    parts, starts = [], range(0, length, step)
+    with ThreadPoolExecutor(workers) as ex:
+        for i, f in enumerate(as_completed([ex.submit(chunk, t) for t in starts]), 1):
+            parts += f.result()
+            print(f"\r  chat: {round(100 * i / len(starts))}%  ({len(parts)} messages)", end="", flush=True)
+    print()
+    seen, comments = set(), []
+    for n in sorted(parts, key=lambda n: n["contentOffsetSeconds"]):
+        if n["id"] not in seen:
+            seen.add(n["id"])
+            comments.append({"content_offset_seconds": n["contentOffsetSeconds"],
+                             "commenter": {"name": (n.get("commenter") or {}).get("login") or ""},
+                             "message": {"body": "".join(f.get("text") or "" for f in n["message"]["fragments"])}})
+    path.write_text(json.dumps({"streamer": {"name": video["creator"]["login"]},
+                                "video": {"id": vid, "created_at": video["publishedAt"], "length": length,
+                                          "title": video["title"]}, "comments": comments}), encoding="utf-8")
+
+
 def vod(a):
     m = re.search(r"(\d{6,})", a.vod)
     if not m:
@@ -187,7 +242,10 @@ def vod(a):
     chat_file = Path(a.chat) if a.chat else out / "chat.json"
     if not chat_file.exists():
         log("downloading chat (a long, busy VOD can take a few minutes)...")
-        run([find_tdl(a), "chatdownload", "--id", vid, "-o", chat_file])
+        if a.tdl:
+            run([find_tdl(a), "chatdownload", "--id", vid, "-o", chat_file])
+        else:
+            download_chat(vid, chat_file)
     data = json.loads(chat_file.read_text(encoding="utf-8-sig"))
     chat = [(c["content_offset_seconds"], (c.get("commenter") or {}).get("name") or "",
              (c.get("message") or {}).get("body") or "") for c in data.get("comments", [])]
@@ -300,6 +358,7 @@ def main():
     g.add_argument("--bucket", type=int, default=10, help="counting slice in seconds (default 10)")
     g.add_argument("--min-msgs", type=int, default=5, help="ignore moments with fewer people (default 5)")
     g.add_argument("--min-score", type=float, default=2, help="ignore moments under Nx normal (default 2)")
+    g.add_argument("--keep-polls", action="store_true", help='keep moments where chat answers the streamer ("+1", "yo")')
     g.add_argument("--layout", choices=LAYOUTS, default="crop",
                    help="crop = 9:16 fill (default), fit = whole frame on blurred 9:16, wide = keep 16:9")
     g.add_argument("--model", default="small", help="whisper: tiny/base/small/medium/large-v3 (default small)")
@@ -318,7 +377,7 @@ def main():
     v.add_argument("vod", help="VOD link or id")
     v.add_argument("--chat", help="TwitchDownloader chat .json you already have")
     v.add_argument("--video", help="cut from a video file you already have")
-    v.add_argument("--tdl", help="path to TwitchDownloaderCLI")
+    v.add_argument("--tdl", help="use TwitchDownloaderCLI at this path for the chat instead")
     l = sub.add_parser("live", aliases=["record"], parents=[common], help="record a live stream and clip it")
     l.add_argument("channel")
     l.add_argument("--once", action="store_true", help="stop after one stream")
@@ -330,7 +389,7 @@ def main():
     if not shutil.which("ffmpeg"):
         sys.exit("ffmpeg not found - see README.md")
     try:
-        import streamlink, websockets, faster_whisper  # noqa: F401
+        import streamlink, websockets, faster_whisper, twitchdl  # noqa: F401
     except ImportError as e:
         sys.exit(f"{e.name} missing - run: py -m pip install -r requirements.txt")
     try:

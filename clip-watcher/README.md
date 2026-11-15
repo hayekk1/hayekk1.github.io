@@ -8,9 +8,6 @@ Combines the "Chat Clip Finder" guide (VOD mode) with live recording and auto ca
 1. **Python 3.10+**: python.org, or `winget install Python.Python.3.12`. On Mac use `brew install python`.
 2. **ffmpeg**: `winget install Gyan.FFmpeg`. On Mac use `brew install ffmpeg`.
 3. In this folder: `py -m pip install -r requirements.txt` (Mac: `python3 -m pip ...`)
-4. **For VOD mode**: download TwitchDownloaderCLI from github.com/lay295/TwitchDownloader/releases.
-   Pick `Windows-x64.zip`, `MacOSArm64.zip` (M1-M4) or `MacOS-x64.zip` (Intel), then unzip it into this folder.
-   On Mac, also run `chmod +x TwitchDownloaderCLI`.
 
 ## Use
 
@@ -19,7 +16,7 @@ Combines the "Chat Clip Finder" guide (VOD mode) with live recording and auto ca
 py clipwatch.py vod https://www.twitch.tv/videos/1234567890 --preview   # see the moments first
 py clipwatch.py vod https://www.twitch.tv/videos/1234567890             # cut them
 ```
-It downloads only the chat and the 30s around each moment, not the whole stream.
+It downloads only the chat (12 parts at once) and the 30s around each moment, not the whole stream.
 
 **Live.** Waits for the channel to go live, records it, and clips when the stream ends:
 ```
@@ -46,6 +43,7 @@ Output goes to `recordings/.../clips/`:
 | `--gap` | 90 | min seconds between two clips |
 | `--min-score` | 2 | ignore moments under 2x normal chat |
 | `--chat chat.json` | | use a TwitchDownloader chat file you already have |
+| `--tdl PATH` | | download chat with TwitchDownloaderCLI instead of the built-in downloader |
 | `--video file.mp4` | | cut from a video you already have |
 | `--quality` | best | e.g. `720p60` (falls back to best) |
 
