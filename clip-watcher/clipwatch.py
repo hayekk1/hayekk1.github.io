@@ -95,7 +95,9 @@ def captions(cut, a):
     pcm = run(["ffmpeg", "-loglevel", "error", *cut, "-vn", "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
               capture_output=True).stdout
     segs, _ = _model.transcribe(np.frombuffer(pcm, np.float32), language=a.lang, vad_filter=True,
-                                word_timestamps=True)
+                                word_timestamps=True, condition_on_previous_text=False)
+    # drop made-up text over music/silence (a known whisper habit)
+    segs = [s for s in segs if s.no_speech_prob < 0.6 and s.avg_logprob > -1 and s.compression_ratio < 2.2]
     chunks, cur = [], []
     for w in (w for s in segs for w in (s.words or [])):
         if cur and (len(cur) >= a.words or w.start - cur[-1].end > 0.6):
